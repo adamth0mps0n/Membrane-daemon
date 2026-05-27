@@ -1,0 +1,13 @@
+/target
+/Cargo.lock.bak
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor temp files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

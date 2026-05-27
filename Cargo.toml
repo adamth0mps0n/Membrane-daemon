@@ -1,0 +1,14 @@
+[workspace]
+members = ["membrane-wire", "membrane-daemon"]
+resolver = "2"
+
+# Substrate operations are the hot path; LTO + opt-level 3 worth the link cost.
+# Same release profile as the private monorepo so binaries built here
+# are byte-equivalent (modulo path strings in debug info) to those
+# built in the development workspace.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+strip = "symbols"

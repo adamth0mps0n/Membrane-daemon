@@ -1,0 +1,195 @@
+# Release workflow: cross-build membrane-daemon for all supported platforms,
+# blake3-hash each binary, attach binaries + manifest.json to a GitHub release.
+#
+# Triggered by pushing a tag `v*` (e.g. `v0.1.0`, `v0.2.1`). The release is
+# created automatically and binaries are uploaded as release assets.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create GitHub release + upload assets
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — built on Ubuntu 22.04 (glibc 2.35) so the
+          # binary runs on Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 36+.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: membrane-daemon-linux-x86_64
+            cross: false
+
+          # Linux aarch64 — cross-compiled on Ubuntu 22.04.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: membrane-daemon-linux-aarch64
+            cross: true
+
+          # macOS Apple Silicon (M1/M2/M3/M4).
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            artifact: membrane-daemon-darwin-aarch64
+            cross: false
+
+          # macOS Intel.
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            artifact: membrane-daemon-darwin-x86_64
+            cross: false
+
+          # Windows x86_64.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            artifact: membrane-daemon-windows-x86_64.exe
+            cross: false
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: install cross-compile tools (linux-aarch64)
+        if: matrix.cross == true && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: build release
+        run: cargo build --release --target ${{ matrix.target }} -p membrane-daemon --bin membrane-daemon
+
+      - name: rename binary (unix)
+        if: matrix.runner != 'windows-2022'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/membrane-daemon" "${{ matrix.artifact }}"
+          chmod 0755 "${{ matrix.artifact }}"
+
+      - name: rename binary (windows)
+        if: matrix.runner == 'windows-2022'
+        shell: bash
+        run: |
+          cp "target/${{ matrix.target }}/release/membrane-daemon.exe" "${{ matrix.artifact }}"
+
+      - name: compute blake3 hash
+        shell: bash
+        run: |
+          cargo install --quiet b3sum
+          HASH="$(b3sum --no-names "${{ matrix.artifact }}")"
+          SIZE="$(wc -c < "${{ matrix.artifact }}")"
+          echo "BLAKE3_HASH=$HASH"   >> "$GITHUB_ENV"
+          echo "BINARY_SIZE=$SIZE"   >> "$GITHUB_ENV"
+
+      - name: write per-platform manifest fragment
+        shell: bash
+        run: |
+          mkdir -p manifest-fragments
+          cat > "manifest-fragments/${{ matrix.artifact }}.json" <<EOF
+          {
+            "name": "${{ matrix.artifact }}",
+            "blake3": "${BLAKE3_HASH}",
+            "size": ${BINARY_SIZE},
+            "platform": "${{ matrix.target }}",
+            "version": "${GITHUB_REF_NAME#v}"
+          }
+          EOF
+          cat "manifest-fragments/${{ matrix.artifact }}.json"
+
+      - name: upload binary as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 7
+
+      - name: upload manifest fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-fragment-${{ matrix.artifact }}
+          path: manifest-fragments/${{ matrix.artifact }}.json
+          retention-days: 7
+
+  manifest:
+    name: assemble manifest + release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: assemble manifest.json
+        run: |
+          python3 <<'PY'
+          import json, os, glob
+          version = os.environ['GITHUB_REF_NAME'].lstrip('v')
+          manifest = {"version": version, "files": {}}
+          for path in glob.glob('artifacts/manifest-fragment-*/*.json'):
+              with open(path) as f:
+                  entry = json.load(f)
+              name = entry.pop('name')
+              manifest['files'][name] = entry
+          os.makedirs('release', exist_ok=True)
+          with open('release/manifest.json', 'w') as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+          PY
+          cat release/manifest.json
+
+      - name: collect binaries into release dir
+        run: |
+          for dir in artifacts/membrane-daemon-*; do
+            name=$(basename "$dir")
+            cp "$dir/$name" "release/$name"
+            chmod 0755 "release/$name" || true
+          done
+          ls -la release/
+
+      - name: create github release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: membrane-daemon ${{ github.ref_name }}
+          body: |
+            Pre-built binaries for membrane-daemon ${{ github.ref_name }}.
+
+            All binaries are Blake3-hashed; the hashes are listed in `manifest.json`.
+
+            ## Install
+            ```sh
+            curl -fsSL https://mcp.membrane.informationpatterns.com/install.sh \
+                | sh -s -- --pair-token pair_xxxx
+            ```
+
+            Get the pair-token from your account at
+            https://mcp.membrane.informationpatterns.com/account/agents.
+          files: |
+            release/manifest.json
+            release/membrane-daemon-*
+          fail_on_unmatched_files: false

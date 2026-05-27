@@ -1,0 +1,16 @@
+[package]
+name = "membrane-wire"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Adam Thompson <adam@informationpatterns.com>"]
+description = "Wire protocol types shared between membrane cloud and daemon."
+repository = "https://github.com/adamth0mps0n/Membrane-daemon"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+
+[lib]
+name = "membrane_wire"
+path = "src/lib.rs"
