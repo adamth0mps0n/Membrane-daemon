@@ -321,6 +321,84 @@ fn cmd_audit(_cfg: Config, since: Option<&str>, limit: usize) -> anyhow::Result<
 /// This collapses the three-step manual flow (generate CSR → send to
 /// operator → install token) into one operation, suitable for
 /// self-serve onboarding where the customer already has an API key.
+
+/// Normalise a cloud URL by stripping trailing slashes and any
+/// known cloud-side paths that users sometimes paste by mistake.
+/// We accept whatever URL the user gave and always end up with a
+/// bare scheme://host[:port] base.
+fn normalise_cloud_url(input: &str) -> String {
+    let mut s = input.trim().trim_end_matches('/').to_string();
+    // Iteratively strip the most common wrong-paste suffixes. A
+    // single loop pass handles compounding (e.g. `/v1/mcp/` →
+    // `/v1/mcp` → trimmed → `/v1` → trimmed). Bounded so a
+    // pathological input can't loop forever.
+    let strip_suffixes = [
+        "/v1/mcp",
+        "/v1/agent/enroll",
+        "/v1/agent",
+        "/v1",
+        "/account/agents",
+        "/account/signup",
+        "/account/login",
+        "/account",
+        "/admin/tenants",
+        "/admin",
+        "/docs",
+    ];
+    for _ in 0..6 {
+        let before = s.len();
+        for suffix in &strip_suffixes {
+            if s.ends_with(suffix) {
+                s.truncate(s.len() - suffix.len());
+                s = s.trim_end_matches('/').to_string();
+                break;
+            }
+        }
+        if s.len() == before { break; }
+    }
+    s
+}
+
+#[cfg(test)]
+mod normalise_tests {
+    use super::normalise_cloud_url;
+
+    #[test]
+    fn bare_base_url_unchanged() {
+        assert_eq!(normalise_cloud_url("https://mcp.example.com"), "https://mcp.example.com");
+    }
+
+    #[test]
+    fn strips_trailing_slash() {
+        assert_eq!(normalise_cloud_url("https://mcp.example.com/"), "https://mcp.example.com");
+    }
+
+    #[test]
+    fn strips_mcp_path() {
+        // The bug Marcus hit: pasted the MCP URL instead of the base.
+        assert_eq!(
+            normalise_cloud_url("https://mcp.example.com/v1/mcp"),
+            "https://mcp.example.com"
+        );
+    }
+
+    #[test]
+    fn strips_account_paths() {
+        assert_eq!(
+            normalise_cloud_url("https://mcp.example.com/account/agents"),
+            "https://mcp.example.com"
+        );
+    }
+
+    #[test]
+    fn handles_whitespace_and_trailing_slash() {
+        assert_eq!(
+            normalise_cloud_url("  https://mcp.example.com/v1/mcp/  "),
+            "https://mcp.example.com"
+        );
+    }
+}
+
 fn cmd_pair_enrol(
     cfg: Config,
     cloud_url: &str,
@@ -341,8 +419,15 @@ fn cmd_pair_enrol(
     let csr_pem = pairing::build_csr(&kp)?;
 
     // 2. POST to cloud.
-    let url = format!("{}/v1/agent/enroll",
-        cloud_url.trim_end_matches('/'));
+    // Be tolerant of common URL-paste mistakes: people pasting the
+    // MCP endpoint URL (e.g. `.../v1/mcp`) instead of the cloud's
+    // base URL. Strip known cloud-side paths so we always hit
+    // `/v1/agent/enroll`.
+    let base = normalise_cloud_url(cloud_url);
+    if base != cloud_url.trim_end_matches('/') {
+        eprintln!("note: stripped trailing path from --enrol; using base URL {base}");
+    }
+    let url = format!("{base}/v1/agent/enroll");
     eprintln!("enrolling against {url}");
 
     let client = reqwest::blocking::Client::builder()
@@ -356,8 +441,28 @@ fn cmd_pair_enrol(
         .send()
         .with_context(|| format!("POST {url}"))?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json()
-        .context("decode JSON response")?;
+    // Capture the raw body so we can give a useful error if the
+    // server didn't return JSON — far more useful than the bare
+    // "EOF while parsing a value" message.
+    let body_bytes = resp.bytes()
+        .with_context(|| format!("read response body from {url}"))?;
+    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let preview = String::from_utf8_lossy(&body_bytes);
+            let preview = preview.chars().take(200).collect::<String>();
+            anyhow::bail!(
+                "enrolment endpoint returned non-JSON response (status {status})\n\
+                 \n\
+                 This usually means the --enrol URL is wrong. Make sure you're\n\
+                 passing the cloud's base URL (e.g. https://mcp.example.com),\n\
+                 not the MCP endpoint (e.g. https://mcp.example.com/v1/mcp).\n\
+                 \n\
+                 Server returned: {preview}\n\
+                 Parse error: {e}"
+            );
+        }
+    };
 
     if !status.is_success() {
         let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("(unknown error)");
